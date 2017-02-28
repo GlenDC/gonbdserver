@@ -8,9 +8,11 @@
 package nbd
 
 import (
+	"os"
+	"strconv"
+
 	"github.com/traetox/goaio"
 	"golang.org/x/net/context"
-	"os"
 )
 
 // AioFileBackend implements Backend
@@ -92,11 +94,10 @@ func NewAioFileBackend(ctx context.Context, ec *ExportConfig) (Backend, error) {
 	if ec.ReadOnly {
 		perms = os.O_RDONLY
 	}
-	if s, err := isTrue(ec.DriverParameters["sync"]); err != nil {
-		return nil, err
-	} else if s {
+	if s, _ := strconv.ParseBool(ec.DriverParameters["sync"]); s {
 		perms |= os.O_SYNC
 	}
+
 	aio, err := goaio.NewAIO(ec.DriverParameters["path"], perms, 0666)
 	if err != nil {
 		return nil, err

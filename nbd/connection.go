@@ -5,15 +5,17 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"golang.org/x/net/context"
 	"io"
 	"log"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 // Default number of workers
@@ -1078,76 +1080,77 @@ func roundUpToNextPowerOfTwo(x uint64) uint64 {
 
 // connectExport generates an export for a given name, and connects to it using the chosen backend
 func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Export, error) {
-	forceFlush, forceNoFlush, err := isTrueFalse(ec.DriverParameters["flush"])
-	if err != nil {
-		return nil, err
-	}
-	forceFua, forceNoFua, err := isTrueFalse(ec.DriverParameters["fua"])
-	if err != nil {
-		return nil, err
-	}
-	if backendgen, ok := BackendMap[strings.ToLower(ec.Driver)]; !ok {
+	// defaults to false in case of error,
+	// this is good enough for our purposes
+	forceFlush, _ := strconv.ParseBool(ec.DriverParameters["flush"])
+	forceFua, _ := strconv.ParseBool(ec.DriverParameters["fua"])
+
+	backendgen, ok := BackendMap[strings.ToLower(ec.Driver)]
+	if !ok {
 		return nil, fmt.Errorf("No such driver %s", ec.Driver)
-	} else {
-		if backend, err := backendgen(ctx, ec); err != nil {
-			return nil, err
-		} else {
-			size, minimumBlockSize, preferredBlockSize, maximumBlockSize, err := backend.Geometry(ctx)
-			if err != nil {
-				backend.Close(ctx)
-				return nil, err
-			}
-			if c.backend != nil {
-				c.backend.Close(ctx)
-			}
-			c.backend = backend
-			if ec.MinimumBlockSize != 0 {
-				minimumBlockSize = ec.MinimumBlockSize
-			}
-			if ec.PreferredBlockSize != 0 {
-				preferredBlockSize = ec.PreferredBlockSize
-			}
-			if ec.MaximumBlockSize != 0 {
-				maximumBlockSize = ec.MaximumBlockSize
-			}
-			if minimumBlockSize == 0 {
-				minimumBlockSize = 1
-			}
-			minimumBlockSize = roundUpToNextPowerOfTwo(minimumBlockSize)
-			preferredBlockSize = roundUpToNextPowerOfTwo(preferredBlockSize)
-			// ensure preferredBlockSize is a multiple of the minimum block size
-			preferredBlockSize = preferredBlockSize & ^(minimumBlockSize - 1)
-			if preferredBlockSize < minimumBlockSize {
-				preferredBlockSize = minimumBlockSize
-			}
-			// ensure maximumBlockSize is a multiple of preferredBlockSize
-			maximumBlockSize = maximumBlockSize & ^(preferredBlockSize - 1)
-			if maximumBlockSize < preferredBlockSize {
-				maximumBlockSize = preferredBlockSize
-			}
-			flags := uint16(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_WRITE_ZEROES | NBD_FLAG_SEND_CLOSE)
-			if (backend.HasFua(ctx) || forceFua) && !forceNoFua {
-				flags |= NBD_FLAG_SEND_FUA
-			}
-			if (backend.HasFlush(ctx) || forceFlush) && !forceNoFlush {
-				flags |= NBD_FLAG_SEND_FLUSH
-			}
-			size = size & ^(minimumBlockSize - 1)
-			return &Export{
-				size:               size,
-				exportFlags:        flags,
-				name:               ec.Name,
-				readonly:           ec.ReadOnly,
-				workers:            ec.Workers,
-				tlsonly:            ec.TlsOnly,
-				description:        ec.Description,
-				minimumBlockSize:   minimumBlockSize,
-				preferredBlockSize: preferredBlockSize,
-				maximumBlockSize:   maximumBlockSize,
-				memoryBlockSize:    preferredBlockSize,
-			}, nil
-		}
 	}
+
+	backend, err := backendgen(ctx, ec)
+	if err != nil {
+		return nil, err
+	}
+
+	size, minimumBlockSize, preferredBlockSize, maximumBlockSize, err := backend.Geometry(ctx)
+	if err != nil {
+		backend.Close(ctx)
+		return nil, err
+	}
+	if c.backend != nil {
+		c.backend.Close(ctx)
+	}
+	c.backend = backend
+	if ec.MinimumBlockSize != 0 {
+		minimumBlockSize = ec.MinimumBlockSize
+	}
+	if ec.PreferredBlockSize != 0 {
+		preferredBlockSize = ec.PreferredBlockSize
+	}
+	if ec.MaximumBlockSize != 0 {
+		maximumBlockSize = ec.MaximumBlockSize
+	}
+	if minimumBlockSize == 0 {
+		minimumBlockSize = 1
+	}
+	minimumBlockSize = roundUpToNextPowerOfTwo(minimumBlockSize)
+	preferredBlockSize = roundUpToNextPowerOfTwo(preferredBlockSize)
+	// ensure preferredBlockSize is a multiple of the minimum block size
+	preferredBlockSize = preferredBlockSize & ^(minimumBlockSize - 1)
+	if preferredBlockSize < minimumBlockSize {
+		preferredBlockSize = minimumBlockSize
+	}
+	// ensure maximumBlockSize is a multiple of preferredBlockSize
+	maximumBlockSize = maximumBlockSize & ^(preferredBlockSize - 1)
+	if maximumBlockSize < preferredBlockSize {
+		maximumBlockSize = preferredBlockSize
+	}
+
+	flags := uint16(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_WRITE_ZEROES | NBD_FLAG_SEND_CLOSE)
+	if backend.HasFua(ctx) || forceFua {
+		flags |= NBD_FLAG_SEND_FUA
+	}
+	if backend.HasFlush(ctx) || forceFlush {
+		flags |= NBD_FLAG_SEND_FLUSH
+	}
+
+	size = size & ^(minimumBlockSize - 1)
+	return &Export{
+		size:               size,
+		exportFlags:        flags,
+		name:               ec.Name,
+		readonly:           ec.ReadOnly,
+		workers:            ec.Workers,
+		tlsonly:            ec.TlsOnly,
+		description:        ec.Description,
+		minimumBlockSize:   minimumBlockSize,
+		preferredBlockSize: preferredBlockSize,
+		maximumBlockSize:   maximumBlockSize,
+		memoryBlockSize:    preferredBlockSize,
+	}, nil
 }
 
 func RegisterBackend(name string, generator func(ctx context.Context, e *ExportConfig) (Backend, error)) {
