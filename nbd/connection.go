@@ -219,15 +219,16 @@ func (c *Connection) transmit(ctx context.Context) bool {
 	// handle request command
 	switch req.NbdCommandType {
 	case NBD_CMD_READ:
+		length := length // make length local
+		// need to write to a byteBuffer, as we can't write directly
+		// to the connection, due to having to have to write the header first
+		buffer = new(bytes.Buffer)
+
 		for i := 0; length > 0; i++ {
 			blocklen := c.export.memoryBlockSize
 			if blocklen > length {
 				blocklen = length
 			}
-
-			// need to write to a byteBuffer, as we can't write directly
-			// to the connection, due to having to have to write the header first
-			buffer = new(bytes.Buffer)
 
 			// WARNING: potential overflow (blocklen, offset)
 			n, err := c.backend.ReadAt(ctx, buffer, int64(blocklen), int64(offset))
@@ -246,6 +247,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 		}
 
 	case NBD_CMD_WRITE:
+		length, offset := length, offset // make length,offset local
 		for i := 0; length > 0; i++ {
 			blocklen := c.export.memoryBlockSize
 			if blocklen > length {
@@ -273,6 +275,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 		}
 
 	case NBD_CMD_WRITE_ZEROES:
+		length, offset := length, offset // make length,offset local
 		// Requires us to read zero data
 		// Previously a 2D slice buffer was allocated/reused and zero-memoried
 		// now we simply make use of the fact that a slice buffer
@@ -304,6 +307,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 		c.backend.Flush(ctx)
 
 	case NBD_CMD_TRIM:
+		length, offset := length, offset // make length,offset local
 		for i := 0; length > 0; i++ {
 			blocklen := c.export.memoryBlockSize
 			if blocklen > length {
@@ -327,38 +331,53 @@ func (c *Connection) transmit(ctx context.Context) bool {
 		}
 
 	case NBD_CMD_DISC:
-		c.logger.Printf("[INFO] Client %s requested disconnect", c.name)
+		c.logger.Printf("[INFO] Client %s requested disconnect\n", c.name)
 		if err := c.backend.Flush(ctx); err != nil {
-			c.logger.Printf("[ERROR] Client %s cannot flush backend: %s", c.name, err)
+			c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
 		}
 
 		return true
 
 	case NBD_CMD_CLOSE:
-		c.logger.Printf("[INFO] Client %s requested close", c.name)
+		c.logger.Printf("[INFO] Client %s requested close\n", c.name)
 		if err := c.backend.Flush(ctx); err != nil {
-			c.logger.Printf("[ERROR] Client %s cannot flush backend: %s", c.name, err)
+			c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
 		}
 		// still need to reply
 
 	default:
-		c.logger.Printf("[ERROR] Client %s sent unknown command %d",
+		c.logger.Printf("[ERROR] Client %s sent unknown command %d\n",
 			c.name, req.NbdCommandType)
 		return true // perhaps next command is valid
 	}
 
 	// send the reply back
 	if err := binary.Write(c.conn, binary.BigEndian, nbdRep); err != nil {
-		c.logger.Printf("[ERROR] Client %s cannot write reply", c.name)
+		c.logger.Printf("[ERROR] Client %s cannot write reply header\n", c.name)
 		return true
 	}
 
-	if flags&CMDT_REP_PAYLOAD != 0 && buffer != nil {
-		n, err := c.conn.Write(buffer.Bytes())
-		// WARNING: potential underflow (n)
-		if err != nil || uint64(n) != length {
-			c.logger.Printf("[ERROR] Client %s cannot write reply", c.name)
-			return true
+	if flags&CMDT_REP_PAYLOAD != 0 && buffer != nil && buffer.Len() > 0 {
+		length := length // make length local
+
+		for length > 0 {
+			blocklen := c.export.memoryBlockSize
+			if blocklen > length {
+				blocklen = length
+			}
+
+			// WARNING: potential overflow (blocklen)
+			n, err := io.CopyN(c.conn, buffer, int64(blocklen))
+			if err != nil {
+				c.logger.Printf("[ERROR] Client %s cannot write reply payload: %s\n", c.name, err)
+				return false
+			}
+			// WARNING: potential underflow (n)
+			if uint64(n) != blocklen {
+				c.logger.Printf("[ERROR] Client %s cannot write reply complete payload: wrote %d bytes instead of %d bytes\n", c.name, n, length)
+				return false
+			}
+			length -= blocklen
 		}
 
 		buffer = nil
