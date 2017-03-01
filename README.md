@@ -199,6 +199,34 @@ The `logging` item consists of the following:
 * `UTC`: set to `true` to log the time in UTC, else set to `false`. Optional. Defaults to `false`. Note if logging to syslog, your syslog daemon may add the time anyway.
 * `SourceFile`: set to `true` to log the source file emitting the log message, else set to `false`. Optional. Defaults to `false`.
 
+Benchmarks
+----------
+
+Benchmarks for the nbd package are available and can be run as follows:
+
+```shell
+$ scripts/benchmark_nbd.sh
+```
+
+In case you don't wish to run benchmarks related to `AIO` you can run it as follows:
+
+```shell
+$ scripts/benchmark_nbd.sh --no-aio
+```
+
+By default the script assumes you have build a test binary as follows:
+
+```shell
+$ go test ./nbd -c -o nbd.test
+```
+
+You can overrwrite this assumption by specifying the name of the binary as
+a positional argument to the the benchmark script:
+
+```shell
+$ scripts/benchmark_nbd.sh /my/test/binaries/nbd
+```
+
 Licence
 -------
 
