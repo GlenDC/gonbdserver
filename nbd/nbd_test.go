@@ -34,7 +34,7 @@ servers:
     driver: rbd
     readonly: false
     image: rbdbar
-{{if .Tls}}
+{{if .TLS}}
   tls:
     keyfile: {{.TempDir}}/server-key.pem
     certfile: {{.TempDir}}/server-cert.pem
@@ -49,7 +49,7 @@ var longtests = flag.Bool("longtests", false, "enable long tests")
 var noFlush = flag.Bool("noflush", false, "Disable flush and FUA (for benchmarking - do not use in production")
 
 type TestConfig struct {
-	Tls     bool
+	TLS     bool
 	TempDir string
 	Driver  string
 	NoFlush bool
@@ -159,7 +159,7 @@ func (ni *NbdInstance) Close() {
 }
 
 // make an appropriate TLS config
-func (ni *NbdInstance) getTlsConfig(t *testing.T) (*tls.Config, error) {
+func (ni *NbdInstance) getTLSConfig(t *testing.T) (*tls.Config, error) {
 	keyFile := path.Join(ni.TempDir, "client-key.pem")
 	certFile := path.Join(ni.TempDir, "client-cert.pem")
 	caCertFile := path.Join(ni.TempDir, "ca-cert.pem")
@@ -222,10 +222,10 @@ func (ni *NbdInstance) Connect(t *testing.T) error {
 
 	t.Logf("Connected")
 
-	if ni.Tls {
+	if ni.TLS {
 		tlsOpt := nbdClientOpt{
 			NbdOptMagic: NBD_OPTS_MAGIC,
-			NbdOptId:    NBD_OPT_STARTTLS,
+			NbdOptID:    NBD_OPT_STARTTLS,
 			NbdOptLen:   0,
 		}
 		if err = binary.Write(ni.conn, binary.BigEndian, tlsOpt); err != nil {
@@ -238,7 +238,7 @@ func (ni *NbdInstance) Connect(t *testing.T) error {
 		if tlsOptReply.NbdOptReplyMagic != NBD_REP_MAGIC {
 			return fmt.Errorf("Tls option reply had wrong magic (%x)", tlsOptReply.NbdOptReplyMagic)
 		}
-		if tlsOptReply.NbdOptId != NBD_OPT_STARTTLS {
+		if tlsOptReply.NbdOptID != NBD_OPT_STARTTLS {
 			return fmt.Errorf("Tls option reply had wrong id")
 		}
 		if tlsOptReply.NbdOptReplyType != NBD_REP_ACK {
@@ -248,25 +248,26 @@ func (ni *NbdInstance) Connect(t *testing.T) error {
 			return fmt.Errorf("Tls option reply had bogus length")
 		}
 
-		if tlsConfig, err := ni.getTlsConfig(t); err != nil {
+		tlsConfig, err := ni.getTLSConfig(t)
+		if err != nil {
 			return fmt.Errorf("Could not get TLS config: %v", err)
-		} else {
-			tls := tls.Client(ni.conn, tlsConfig)
-			ni.tlsConn = tls
-			ni.conn = tls
-			ni.plainConn.SetDeadline(time.Time{})
-			ni.conn.SetDeadline(time.Now().Add(time.Second))
+		}
 
-			// explicitly handshake so we get an error here if there is an issue
-			if err := tls.Handshake(); err != nil {
-				return fmt.Errorf("TLS handshake failed: %s", err)
-			}
+		tls := tls.Client(ni.conn, tlsConfig)
+		ni.tlsConn = tls
+		ni.conn = tls
+		ni.plainConn.SetDeadline(time.Time{})
+		ni.conn.SetDeadline(time.Now().Add(time.Second))
+
+		// explicitly handshake so we get an error here if there is an issue
+		if err := tls.Handshake(); err != nil {
+			return fmt.Errorf("TLS handshake failed: %s", err)
 		}
 	}
 
 	listOpt := nbdClientOpt{
 		NbdOptMagic: NBD_OPTS_MAGIC,
-		NbdOptId:    NBD_OPT_LIST,
+		NbdOptID:    NBD_OPT_LIST,
 		NbdOptLen:   0,
 	}
 	if err = binary.Write(ni.conn, binary.BigEndian, listOpt); err != nil {
@@ -283,7 +284,7 @@ listloop:
 		if listOptReply.NbdOptReplyMagic != NBD_REP_MAGIC {
 			return fmt.Errorf("List option reply had wrong magic (%x)", listOptReply.NbdOptReplyMagic)
 		}
-		if listOptReply.NbdOptId != NBD_OPT_LIST {
+		if listOptReply.NbdOptID != NBD_OPT_LIST {
 			return fmt.Errorf("List option reply had wrong id")
 		}
 		switch listOptReply.NbdOptReplyType {
@@ -323,7 +324,7 @@ func (ni *NbdInstance) Abort(t *testing.T) error {
 
 	opt := nbdClientOpt{
 		NbdOptMagic: NBD_OPTS_MAGIC,
-		NbdOptId:    NBD_OPT_ABORT,
+		NbdOptID:    NBD_OPT_ABORT,
 		NbdOptLen:   0,
 	}
 	if err = binary.Write(ni.conn, binary.BigEndian, opt); err != nil {
@@ -336,7 +337,7 @@ func (ni *NbdInstance) Abort(t *testing.T) error {
 	if optReply.NbdOptReplyMagic != NBD_REP_MAGIC {
 		return fmt.Errorf("abort option reply had wrong magic (%x)", optReply.NbdOptReplyMagic)
 	}
-	if optReply.NbdOptId != NBD_OPT_ABORT {
+	if optReply.NbdOptID != NBD_OPT_ABORT {
 		return fmt.Errorf("abort option reply had wrong id")
 	}
 	if optReply.NbdOptReplyType != NBD_REP_ACK {
@@ -355,7 +356,7 @@ func (ni *NbdInstance) Go(t *testing.T) error {
 
 	opt := nbdClientOpt{
 		NbdOptMagic: NBD_OPTS_MAGIC,
-		NbdOptId:    NBD_OPT_GO,
+		NbdOptID:    NBD_OPT_GO,
 		NbdOptLen:   uint32(2 + 2*1 + 4 + len(export)),
 	}
 	if err = binary.Write(ni.conn, binary.BigEndian, opt); err != nil {
@@ -369,7 +370,8 @@ func (ni *NbdInstance) Go(t *testing.T) error {
 	if err = binary.Write(ni.conn, binary.BigEndian, infoElement); err != nil {
 		return fmt.Errorf("Could not send go info element")
 	}
-	var nameLength uint32 = uint32(len(export))
+
+	nameLength := uint32(len(export))
 	if err = binary.Write(ni.conn, binary.BigEndian, nameLength); err != nil {
 		return fmt.Errorf("Could not send go export length")
 	}
@@ -385,7 +387,7 @@ infoloop:
 		if optReply.NbdOptReplyMagic != NBD_REP_MAGIC {
 			return fmt.Errorf("Go option reply had wrong magic (%x)", optReply.NbdOptReplyMagic)
 		}
-		if optReply.NbdOptId != NBD_OPT_GO {
+		if optReply.NbdOptID != NBD_OPT_GO {
 			return fmt.Errorf("Go option reply had wrong id")
 		}
 		switch optReply.NbdOptReplyType {
@@ -432,15 +434,14 @@ infoloop:
 
 func (ni *NbdInstance) CreateFile(t *testing.T, size int64) error {
 	filename := path.Join(ni.TempDir, "nbd.img")
-	if file, err := os.Create(filename); err != nil {
+
+	file, err := os.Create(filename)
+	if err != nil {
 		return err
-	} else {
-		defer file.Close()
-		if err := file.Truncate(size); err != nil {
-			return err
-		}
 	}
-	return nil
+	defer file.Close()
+
+	return file.Truncate(size)
 }
 
 func (ni *NbdInstance) Disconnect(t *testing.T) error {
@@ -462,7 +463,7 @@ func (ni *NbdInstance) Disconnect(t *testing.T) error {
 }
 
 func doTestConnection(t *testing.T, tls bool) {
-	ni := StartNbd(t, TestConfig{Tls: tls, NoFlush: *noFlush})
+	ni := StartNbd(t, TestConfig{TLS: tls, NoFlush: *noFlush})
 	defer ni.Close()
 
 	if err := ni.Connect(t); err != nil {
@@ -490,7 +491,7 @@ func doTestConnectionIntegrity(t *testing.T, transationLog []byte, tls bool, dri
 		t.Skip(fmt.Sprintf("Skipping test as driver %s not built", driver))
 		return
 	}
-	ni := StartNbd(t, TestConfig{Tls: tls, Driver: driver, NoFlush: *noFlush})
+	ni := StartNbd(t, TestConfig{TLS: tls, Driver: driver, NoFlush: *noFlush})
 	defer ni.Close()
 
 	if err := ni.CreateFile(t, 50*1024*1024); err != nil {

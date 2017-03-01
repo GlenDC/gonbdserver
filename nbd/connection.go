@@ -110,10 +110,11 @@ func NewConnection(listener *Listener, logger *log.Logger, conn net.Conn) (*Conn
 	return c, nil
 }
 
-// NbdError translates an error returned by golang into an NBD error
+// errorCodeFromGolangError translates an error returned by golang
+// into an NBD error code used for replies
 //
 // This function could do with some serious work!
-func NbdError(error) uint32 {
+func errorCodeFromGolangError(error) uint32 {
 	//  TODO: relate the return value to the given error
 	return NBD_EIO
 }
@@ -232,7 +233,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 			n, err := c.backend.ReadAt(ctx, buffer, int64(blocklen), int64(offset))
 			if err != nil {
 				c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
-				nbdRep.NbdError = NbdError(err)
+				nbdRep.NbdError = errorCodeFromGolangError(err)
 				break
 			} else if uint64(n) != blocklen {
 				c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, length, offset)
@@ -260,7 +261,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 			n, err := c.backend.WriteAt(ctx, c.conn, int64(blocklen), int64(offset), fua)
 			if err != nil {
 				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-				nbdRep.NbdError = NbdError(err)
+				nbdRep.NbdError = errorCodeFromGolangError(err)
 				break
 			} else if uint64(n) != blocklen {
 				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
@@ -288,7 +289,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 			n, err := c.backend.WriteAt(ctx, zeroBuffer, int64(blocklen), int64(offset), fua)
 			if err != nil {
 				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-				nbdRep.NbdError = NbdError(err)
+				nbdRep.NbdError = errorCodeFromGolangError(err)
 				break
 			} else if uint64(n) != blocklen {
 				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
@@ -313,7 +314,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 			n, err := c.backend.TrimAt(ctx, int64(length), int64(offset))
 			if err != nil {
 				c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
-				nbdRep.NbdError = NbdError(err)
+				nbdRep.NbdError = errorCodeFromGolangError(err)
 				break
 			} else if uint64(n) != blocklen {
 				c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, length, offset)
@@ -462,13 +463,13 @@ func (c *Connection) negotiate(ctx context.Context) error {
 		if opt.NbdOptLen > 65536 {
 			return errors.New("Option is too long")
 		}
-		switch opt.NbdOptId {
+		switch opt.NbdOptID {
 		case NBD_OPT_EXPORT_NAME, NBD_OPT_INFO, NBD_OPT_GO:
 			var name []byte
 
 			clientSupportsBlockSizeConstraints := false
 
-			if opt.NbdOptId == NBD_OPT_EXPORT_NAME {
+			if opt.NbdOptID == NBD_OPT_EXPORT_NAME {
 				name = make([]byte, opt.NbdOptLen)
 				n, err := io.ReadFull(c.conn, name)
 				if err != nil {
@@ -523,8 +524,8 @@ func (c *Connection) negotiate(ctx context.Context) error {
 
 			// Next find our export
 			ec, err := c.getExportConfig(ctx, string(name))
-			if err != nil || (ec.TlsOnly && c.tlsConn == nil) {
-				if opt.NbdOptId == NBD_OPT_EXPORT_NAME {
+			if err != nil || (ec.TLSOnly && c.tlsConn == nil) {
+				if opt.NbdOptID == NBD_OPT_EXPORT_NAME {
 					// we have to just abort here
 					if err != nil {
 						return err
@@ -533,7 +534,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				}
 				or := nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_ERR_UNKNOWN,
 					NbdOptReplyLength: 0,
 				}
@@ -551,13 +552,13 @@ func (c *Connection) negotiate(ctx context.Context) error {
 			// connection (assuming we aren't doing NBD_OPT_INFO)
 			export, err := c.connectExport(ctx, ec)
 			if err != nil {
-				if opt.NbdOptId == NBD_OPT_EXPORT_NAME {
+				if opt.NbdOptID == NBD_OPT_EXPORT_NAME {
 					return err
 				}
 				c.logger.Printf("[INFO] Could not connect client %s to %s: %v", c.name, string(name), err)
 				or := nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_ERR_UNKNOWN,
 					NbdOptReplyLength: 0,
 				}
@@ -571,7 +572,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 			name = []byte(export.name)
 			description := []byte(export.description)
 
-			if opt.NbdOptId == NBD_OPT_EXPORT_NAME {
+			if opt.NbdOptID == NBD_OPT_EXPORT_NAME {
 				// this option has a unique reply format
 				ed := nbdExportDetails{
 					NbdExportSize:  export.size,
@@ -584,7 +585,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				// Send NBD_INFO_EXPORT
 				or := nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_INFO,
 					NbdOptReplyLength: 12,
 				}
@@ -603,7 +604,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				// Send NBD_INFO_NAME
 				or = nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_INFO,
 					NbdOptReplyLength: uint32(2 + len(name)),
 				}
@@ -620,7 +621,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				// Send NBD_INFO_DESCRIPTION
 				or = nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_INFO,
 					NbdOptReplyLength: uint32(2 + len(description)),
 				}
@@ -637,7 +638,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				// Send NBD_INFO_BLOCK_SIZE
 				or = nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_INFO,
 					NbdOptReplyLength: 14,
 				}
@@ -663,14 +664,14 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				// Send ACK or error
 				or = nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   replyType,
 					NbdOptReplyLength: 0,
 				}
 				if err := binary.Write(c.conn, binary.BigEndian, or); err != nil {
 					return errors.New("Cannot info ack")
 				}
-				if opt.NbdOptId == NBD_OPT_INFO || or.NbdOptReplyType&NBD_REP_FLAG_ERROR != 0 {
+				if opt.NbdOptID == NBD_OPT_INFO || or.NbdOptReplyType&NBD_REP_FLAG_ERROR != 0 {
 					// Disassociate the backend as we are not closing
 					c.backend.Close(ctx)
 					c.backend = nil
@@ -678,7 +679,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				}
 			}
 
-			if clf.NbdClientFlags&NBD_FLAG_C_NO_ZEROES == 0 && opt.NbdOptId == NBD_OPT_EXPORT_NAME {
+			if clf.NbdClientFlags&NBD_FLAG_C_NO_ZEROES == 0 && opt.NbdOptID == NBD_OPT_EXPORT_NAME {
 				// send 124 bytes of zeroes.
 				zeroes := make([]byte, 124, 124)
 				if err := binary.Write(c.conn, binary.BigEndian, zeroes); err != nil {
@@ -693,7 +694,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				name := []byte(e.Name)
 				or := nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_SERVER,
 					NbdOptReplyLength: uint32(len(name) + 4),
 				}
@@ -710,7 +711,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 			}
 			or := nbdOptReply{
 				NbdOptReplyMagic:  NBD_REP_MAGIC,
-				NbdOptId:          opt.NbdOptId,
+				NbdOptID:          opt.NbdOptID,
 				NbdOptReplyType:   NBD_REP_ACK,
 				NbdOptReplyLength: 0,
 			}
@@ -723,7 +724,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 				c.logger.Printf("[INFO] Rejecting upgrade of connection with %s to TLS", c.name)
 				or := nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_ERR_UNSUP,
 					NbdOptReplyLength: 0,
 				}
@@ -736,7 +737,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 			} else {
 				or := nbdOptReply{
 					NbdOptReplyMagic:  NBD_REP_MAGIC,
-					NbdOptId:          opt.NbdOptId,
+					NbdOptID:          opt.NbdOptID,
 					NbdOptReplyType:   NBD_REP_ACK,
 					NbdOptReplyLength: 0,
 				}
@@ -756,7 +757,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 		case NBD_OPT_ABORT:
 			or := nbdOptReply{
 				NbdOptReplyMagic:  NBD_REP_MAGIC,
-				NbdOptId:          opt.NbdOptId,
+				NbdOptID:          opt.NbdOptID,
 				NbdOptReplyType:   NBD_REP_ACK,
 				NbdOptReplyLength: 0,
 			}
@@ -772,7 +773,7 @@ func (c *Connection) negotiate(ctx context.Context) error {
 			// say it's unsuppported
 			or := nbdOptReply{
 				NbdOptReplyMagic:  NBD_REP_MAGIC,
-				NbdOptId:          opt.NbdOptId,
+				NbdOptID:          opt.NbdOptID,
 				NbdOptReplyType:   NBD_REP_ERR_UNSUP,
 				NbdOptReplyLength: 0,
 			}
@@ -873,7 +874,7 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 		exportFlags:        flags,
 		name:               ec.Name,
 		readonly:           ec.ReadOnly,
-		tlsonly:            ec.TlsOnly,
+		tlsonly:            ec.TLSOnly,
 		description:        ec.Description,
 		minimumBlockSize:   minimumBlockSize,
 		preferredBlockSize: preferredBlockSize,

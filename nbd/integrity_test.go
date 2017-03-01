@@ -7,13 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"github.com/mattn/go-isatty"
 	"io"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mattn/go-isatty"
 )
 
 const (
@@ -94,67 +95,70 @@ func (it *IntegrityTest) Reader() {
 	// defer fmt.Fprintf(os.Stderr, ">>>> Reader quitting\n")
 
 	for {
-		if peek, err := it.commands.Peek(4); err != nil {
+		peek, err := it.commands.Peek(4)
+		if err != nil {
 			if err == io.EOF {
 				return
 			}
 			it.Abort(fmt.Errorf("Could not peek command source: %v", err))
 			return
-		} else {
-			// the peeked bytes should be one of the command magics
-			// unwrap them manually :-(
-			magic := (uint64(peek[0]) << 24) | (uint64(peek[1]) << 16) | (uint64(peek[2]) << 8) | uint64(peek[3])
+		}
 
-			switch magic {
-			case NBD_REQUEST_MAGIC:
-				var cmd nbdRequest
-				if err := binary.Read(it.commands, binary.BigEndian, &cmd); err != nil {
-					if err == io.EOF {
-						return
-					}
-					it.Abort(fmt.Errorf("Could not read command source: %v", err))
+		// the peeked bytes should be one of the command magics
+		// unwrap them manually :-(
+		magic := (uint64(peek[0]) << 24) | (uint64(peek[1]) << 16) | (uint64(peek[2]) << 8) | uint64(peek[3])
+
+		switch magic {
+		case NBD_REQUEST_MAGIC:
+			var cmd nbdRequest
+			if err := binary.Read(it.commands, binary.BigEndian, &cmd); err != nil {
+				if err == io.EOF {
 					return
 				}
-				if cmd.NbdRequestMagic != NBD_REQUEST_MAGIC {
-					it.Abort(fmt.Errorf("Bad request magic in command source %x", cmd.NbdRequestMagic))
-					return
-				}
-				cmd.NbdOffset &= ^uint64(BLOCKSIZE - 1)
-				cmd.NbdLength &= ^uint32(BLOCKSIZE - 1)
-				cmd.NbdHandle = getHandle()
-				if it.ni.transmissionFlags&NBD_FLAG_SEND_FUA == 0 {
-					cmd.NbdCommandFlags &= ^NBD_CMD_FLAG_FUA
-				}
-				if CmdTypeMap[int(cmd.NbdCommandType)]&CMDT_CHECK_LENGTH_OFFSET == 0 || cmd.NbdLength > 0 {
-					atomic.AddUint64(&it.statRead, 1)
-					select {
-					case it.send <- cmd:
-					case <-it.quit:
-						return
-					}
-				}
-			case NBD_REPLY_MAGIC:
-				var rep nbdReply
-				if err := binary.Read(it.commands, binary.BigEndian, &rep); err != nil {
-					if err == io.EOF {
-						return
-					}
-					it.Abort(fmt.Errorf("Could not read command source: %v", err))
-					return
-					if rep.NbdReplyMagic != NBD_REPLY_MAGIC {
-						it.Abort(fmt.Errorf("Bad reply magic in command source %x", rep.NbdReplyMagic))
-						return
-					}
-				}
-				select {
-				case <-it.quit:
-					return
-				default:
-				}
-			default:
-				it.Abort(fmt.Errorf("Unknown magic: %x", magic))
+				it.Abort(fmt.Errorf("Could not read command source: %v", err))
 				return
 			}
+			if cmd.NbdRequestMagic != NBD_REQUEST_MAGIC {
+				it.Abort(fmt.Errorf("Bad request magic in command source %x", cmd.NbdRequestMagic))
+				return
+			}
+			cmd.NbdOffset &= ^uint64(BLOCKSIZE - 1)
+			cmd.NbdLength &= ^uint32(BLOCKSIZE - 1)
+			cmd.NbdHandle = getHandle()
+			if it.ni.transmissionFlags&NBD_FLAG_SEND_FUA == 0 {
+				cmd.NbdCommandFlags &= ^NBD_CMD_FLAG_FUA
+			}
+			if CmdTypeMap[int(cmd.NbdCommandType)]&CMDT_CHECK_LENGTH_OFFSET == 0 || cmd.NbdLength > 0 {
+				atomic.AddUint64(&it.statRead, 1)
+				select {
+				case it.send <- cmd:
+				case <-it.quit:
+					return
+				}
+			}
+		case NBD_REPLY_MAGIC:
+			var rep nbdReply
+			if err := binary.Read(it.commands, binary.BigEndian, &rep); err != nil {
+				if err == io.EOF {
+					return
+				}
+
+				if rep.NbdReplyMagic != NBD_REPLY_MAGIC {
+					it.Abort(fmt.Errorf("Bad reply magic in command source %x", rep.NbdReplyMagic))
+					return
+				}
+
+				it.Abort(fmt.Errorf("Could not read command source: %v", err))
+				return
+			}
+			select {
+			case <-it.quit:
+				return
+			default:
+			}
+		default:
+			it.Abort(fmt.Errorf("Unknown magic: %x", magic))
+			return
 		}
 	}
 }

@@ -16,19 +16,19 @@ import (
 	"golang.org/x/net/context"
 )
 
-// A single listener on a given net.Conn address
+// Listener defines a single listener on a given net.Conn address
 type Listener struct {
 	logger          *log.Logger    // a logger
 	protocol        string         // the protocol we are listening on
 	addr            string         // the address
 	exports         []ExportConfig // a list of export configurations associated
 	defaultExport   string         // name of default export
-	tls             TlsConfig      // the TLS configuration
+	tls             TLSConfig      // the TLS configuration
 	tlsconfig       *tls.Config    // the TLS configuration
 	disableNoZeroes bool           // disable the 'no zeroes' extension
 }
 
-// An listener type that does what we want
+// DeadlineListener defines a listener type that does what we want
 type DeadlineListener interface {
 	SetDeadline(t time.Time) error
 	net.Listener
@@ -103,8 +103,8 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 
 }
 
-// make an appropriate TLS config
-func (l *Listener) initTls() error {
+// initTLS makes an appropriate TLS config
+func (l *Listener) initTLS() error {
 	keyFile := l.tls.KeyFile
 	if keyFile == "" {
 		return nil // no TLS
@@ -181,9 +181,9 @@ func NewListener(logger *log.Logger, s ServerConfig) (*Listener, error) {
 		exports:         s.Exports,
 		defaultExport:   s.DefaultExport,
 		disableNoZeroes: s.DisableNoZeroes,
-		tls:             s.Tls,
+		tls:             s.TLS,
 	}
-	if err := l.initTls(); err != nil {
+	if err := l.initTLS(); err != nil {
 		return nil, err
 	}
 	return l, nil
