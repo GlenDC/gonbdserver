@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"golang.org/x/net/context"
 	"io/ioutil"
 	"log"
 	"net"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 // A single listener on a given net.Conn address
@@ -83,7 +84,7 @@ func (l *Listener) Listen(parentCtx context.Context, sessionParentCtx context.Co
 			l.logger.Printf("[ERROR] Error %s listening on %s", err, addr)
 		} else {
 			l.logger.Printf("[INFO] Connect to %s from %s", addr, conn.RemoteAddr())
-			if connection, err := newConnection(l, l.logger, conn); err != nil {
+			if connection, err := NewConnection(l, l.logger, conn); err != nil {
 				l.logger.Printf("[ERROR] Error %s establishing connection to %s from %s", err, addr, conn.RemoteAddr())
 				conn.Close()
 			} else {

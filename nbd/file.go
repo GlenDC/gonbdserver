@@ -1,6 +1,8 @@
 package nbd
 
 import (
+	"fmt"
+	"io"
 	"os"
 	"strconv"
 
@@ -14,8 +16,17 @@ type FileBackend struct {
 }
 
 // WriteAt implements Backend.WriteAt
-func (fb *FileBackend) WriteAt(ctx context.Context, b []byte, offset int64, fua bool) (int, error) {
-	n, err := fb.file.WriteAt(b, offset)
+func (fb *FileBackend) WriteAt(ctx context.Context, r io.Reader, length, offset int64, fua bool) (int64, error) {
+	// Set offset relative to origin of file
+	o, err := fb.file.Seek(offset, 0)
+	if err != nil {
+		return 0, fmt.Errorf("couldn't set offset %d: %s", offset, err)
+	}
+	if o != offset {
+		return 0, fmt.Errorf("couldn't set offset %d: got offset at %d instead", offset, o)
+	}
+
+	n, err := io.CopyN(fb.file, r, length)
 	if err != nil || !fua {
 		return n, err
 	}
@@ -27,12 +38,21 @@ func (fb *FileBackend) WriteAt(ctx context.Context, b []byte, offset int64, fua 
 }
 
 // ReadAt implements Backend.ReadAt
-func (fb *FileBackend) ReadAt(ctx context.Context, b []byte, offset int64) (int, error) {
-	return fb.file.ReadAt(b, offset)
+func (fb *FileBackend) ReadAt(ctx context.Context, w io.Writer, length, offset int64) (int64, error) {
+	// Set offset relative to origin of file
+	o, err := fb.file.Seek(offset, 0)
+	if err != nil {
+		return 0, fmt.Errorf("couldn't set offset %d: %s", offset, err)
+	}
+	if o != offset {
+		return 0, fmt.Errorf("couldn't set offset %d: got offset at %d instead", offset, o)
+	}
+
+	return io.CopyN(w, fb.file, length)
 }
 
 // TrimAt implements Backend.TrimAt
-func (fb *FileBackend) TrimAt(ctx context.Context, length int, offset int64) (int, error) {
+func (fb *FileBackend) TrimAt(ctx context.Context, length, offset int64) (int64, error) {
 	return length, nil
 }
 
@@ -46,22 +66,22 @@ func (fb *FileBackend) Close(ctx context.Context) error {
 	return fb.file.Close()
 }
 
-// Size implements Backend.Size
+// Geometry implements Backend.Geometry
 func (fb *FileBackend) Geometry(ctx context.Context) (uint64, uint64, uint64, uint64, error) {
 	return fb.size, 1, 32 * 1024, 128 * 1024 * 1024, nil
 }
 
-// Size implements Backend.HasFua
+// HasFua implements Backend.HasFua
 func (fb *FileBackend) HasFua(ctx context.Context) bool {
 	return true
 }
 
-// Size implements Backend.HasFua
+// HasFlush implements Backend.HasFlush
 func (fb *FileBackend) HasFlush(ctx context.Context) bool {
 	return true
 }
 
-// Generate a new file backend
+// NewFileBackend generates a new file backend
 func NewFileBackend(ctx context.Context, ec *ExportConfig) (Backend, error) {
 	perms := os.O_RDWR
 	if ec.ReadOnly {

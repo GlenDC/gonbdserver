@@ -26,7 +26,6 @@ servers:
   - name: foo
     driver: {{.Driver}}
     path: {{.TempDir}}/nbd.img
-    workers: 20
 {{if .NoFlush}}
     flush: false
     fua: false
@@ -487,7 +486,7 @@ func TestConnectionTls(t *testing.T) {
 }
 
 func doTestConnectionIntegrity(t *testing.T, transationLog []byte, tls bool, driver string) {
-	if _, ok := BackendMap[driver]; !ok {
+	if _, ok := backendMap[driver]; !ok {
 		t.Skip(fmt.Sprintf("Skipping test as driver %s not built", driver))
 		return
 	}
