@@ -69,7 +69,7 @@ type Backend interface {
 	TrimAt(ctx context.Context, offset, length int64) (int64, error)                         // trim
 	Flush(ctx context.Context) error                                                         // flush
 	Close(ctx context.Context) error                                                         // close
-	Geometry(ctx context.Context) (uint64, uint64, uint64, uint64, error)                    // size, minimum BS, preferred BS, maximum BS
+	Geometry(ctx context.Context) (Geometry, error)                                          // size, minimum BS, preferred BS, maximum BS
 	HasFua(ctx context.Context) bool                                                         // does the driver support FUA?
 	HasFlush(ctx context.Context) bool                                                       // does the driver support flush?
 }
@@ -92,6 +92,14 @@ type Export struct {
 	description        string // description of the export
 	readonly           bool   // true if read only
 	tlsonly            bool   // true if only to be served over tls
+}
+
+// Geometry information for a backend
+type Geometry struct {
+	Size               uint64
+	MinimumBlockSize   uint64
+	PreferredBlockSize uint64
+	MaximumBlockSize   uint64
 }
 
 // Reply is an internal structure for propagating replies
@@ -275,61 +283,117 @@ func (c *Connection) receive(ctx context.Context) {
 		case NBD_CMD_READ:
 			rep.length = length
 
-			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.ReadAt(ctx, &rep.payload, int64(offset), int64(length))
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
-				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != length {
-				c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, length, offset)
-				rep.nbdRep.NbdError = NBD_EIO
-				break
+			var n int64
+			var blocklen uint64
+			var err error
+
+			for length > 0 {
+				blocklen = c.export.memoryBlockSize
+				if blocklen > length {
+					blocklen = length
+				}
+
+				// WARNING: potential overflow (blocklen, offset)
+				n, err = c.backend.ReadAt(ctx, &rep.payload, int64(offset), int64(blocklen))
+				if err != nil {
+					c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
+					rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+					break
+				} else if uint64(n) != blocklen {
+					c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, blocklen, offset)
+					rep.nbdRep.NbdError = NBD_EIO
+					break
+				}
+
+				length -= blocklen
+				offset += blocklen
 			}
 
 		case NBD_CMD_WRITE:
-			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.WriteAt(ctx, c.conn, int64(offset), int64(length), fua)
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != length {
-				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
-				rep.nbdRep.NbdError = NBD_EIO
-				break
+			var n int64
+			var blocklen uint64
+			var err error
+
+			for length > 0 {
+				blocklen = c.export.memoryBlockSize
+				if blocklen > length {
+					blocklen = length
+				}
+
+				// WARNING: potential overflow (blocklen, offset)
+				n, err = c.backend.WriteAt(ctx, c.conn, int64(offset), int64(blocklen), fua)
+				if err != nil {
+					c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
+					rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+					break
+				} else if uint64(n) != blocklen {
+					c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, blocklen, offset)
+					rep.nbdRep.NbdError = NBD_EIO
+					break
+				}
+
+				length -= blocklen
+				offset += blocklen
 			}
 
 		case NBD_CMD_WRITE_ZEROES:
 			zmBuffer.Reset()
 			zmBuffer.Grow(int(length))
 
-			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.WriteAt(ctx, &zmBuffer, int64(offset), int64(length), fua)
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != length {
-				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
-				rep.nbdRep.NbdError = NBD_EIO
-				break
+			var n int64
+			var blocklen uint64
+			var err error
+
+			for length > 0 {
+				blocklen = c.export.memoryBlockSize
+				if blocklen > length {
+					blocklen = length
+				}
+
+				// WARNING: potential overflow (blocklen, offset)
+				n, err = c.backend.WriteAt(ctx, &zmBuffer, int64(offset), int64(blocklen), fua)
+				if err != nil {
+					c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
+					rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+					break
+				} else if uint64(n) != blocklen {
+					c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, blocklen, offset)
+					rep.nbdRep.NbdError = NBD_EIO
+					break
+				}
+
+				length -= blocklen
+				offset += blocklen
 			}
 
 		case NBD_CMD_FLUSH:
 			c.backend.Flush(ctx)
 
 		case NBD_CMD_TRIM:
-			// WARNING: potential overflow (length, offset)
-			n, err := c.backend.TrimAt(ctx, int64(offset), int64(length))
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
-				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != length {
-				c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, length, offset)
-				rep.nbdRep.NbdError = NBD_EIO
-				break
+			var n int64
+			var blocklen uint64
+			var err error
+
+			for length > 0 {
+				blocklen = c.export.memoryBlockSize
+				if blocklen > length {
+					blocklen = length
+				}
+
+				// WARNING: potential overflow (length, offset)
+				n, err = c.backend.TrimAt(ctx, int64(offset), int64(blocklen))
+				if err != nil {
+					c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
+					rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+					break
+				} else if uint64(n) != blocklen {
+					c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, blocklen, offset)
+					rep.nbdRep.NbdError = NBD_EIO
+					break
+				}
+
+				length -= blocklen
+				offset += blocklen
 			}
 
 		case NBD_CMD_DISC:
@@ -462,7 +526,7 @@ func (c *Connection) Serve(parentCtx context.Context) {
 	}
 }
 
-// negotiate negotiates a connection
+// negotiate a connection
 func (c *Connection) negotiate(ctx context.Context) error {
 	c.conn.SetDeadline(time.Now().Add(c.params.ConnectionTimeout))
 
@@ -882,7 +946,7 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 		return nil, err
 	}
 
-	size, minimumBlockSize, preferredBlockSize, maximumBlockSize, err := backend.Geometry(ctx)
+	gem, err := backend.Geometry(ctx)
 	if err != nil {
 		backend.Close(ctx)
 		return nil, err
@@ -891,29 +955,30 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 		c.backend.Close(ctx)
 	}
 	c.backend = backend
+
 	if ec.MinimumBlockSize != 0 {
-		minimumBlockSize = ec.MinimumBlockSize
+		gem.MinimumBlockSize = ec.MinimumBlockSize
 	}
 	if ec.PreferredBlockSize != 0 {
-		preferredBlockSize = ec.PreferredBlockSize
+		gem.PreferredBlockSize = ec.PreferredBlockSize
 	}
 	if ec.MaximumBlockSize != 0 {
-		maximumBlockSize = ec.MaximumBlockSize
+		gem.MaximumBlockSize = ec.MaximumBlockSize
 	}
-	if minimumBlockSize == 0 {
-		minimumBlockSize = 1
+	if gem.MinimumBlockSize == 0 {
+		gem.MinimumBlockSize = 1
 	}
-	minimumBlockSize = roundUpToNextPowerOfTwo(minimumBlockSize)
-	preferredBlockSize = roundUpToNextPowerOfTwo(preferredBlockSize)
+	gem.MinimumBlockSize = roundUpToNextPowerOfTwo(gem.MinimumBlockSize)
+	gem.PreferredBlockSize = roundUpToNextPowerOfTwo(gem.PreferredBlockSize)
 	// ensure preferredBlockSize is a multiple of the minimum block size
-	preferredBlockSize = preferredBlockSize & ^(minimumBlockSize - 1)
-	if preferredBlockSize < minimumBlockSize {
-		preferredBlockSize = minimumBlockSize
+	gem.PreferredBlockSize = gem.PreferredBlockSize & ^(gem.MinimumBlockSize - 1)
+	if gem.PreferredBlockSize < gem.MinimumBlockSize {
+		gem.PreferredBlockSize = gem.MinimumBlockSize
 	}
 	// ensure maximumBlockSize is a multiple of preferredBlockSize
-	maximumBlockSize = maximumBlockSize & ^(preferredBlockSize - 1)
-	if maximumBlockSize < preferredBlockSize {
-		maximumBlockSize = preferredBlockSize
+	gem.MaximumBlockSize = gem.MaximumBlockSize & ^(gem.PreferredBlockSize - 1)
+	if gem.MaximumBlockSize < gem.PreferredBlockSize {
+		gem.MaximumBlockSize = gem.PreferredBlockSize
 	}
 
 	flags := uint16(NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_WRITE_ZEROES | NBD_FLAG_SEND_CLOSE)
@@ -924,18 +989,18 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 		flags |= NBD_FLAG_SEND_FLUSH
 	}
 
-	size = size & ^(minimumBlockSize - 1)
+	gem.Size = gem.Size & ^(gem.MinimumBlockSize - 1)
 	return &Export{
-		size:               size,
+		size:               gem.Size,
 		exportFlags:        flags,
 		name:               ec.Name,
 		readonly:           ec.ReadOnly,
 		tlsonly:            ec.TLSOnly,
 		description:        ec.Description,
-		minimumBlockSize:   minimumBlockSize,
-		preferredBlockSize: preferredBlockSize,
-		maximumBlockSize:   maximumBlockSize,
-		memoryBlockSize:    preferredBlockSize,
+		minimumBlockSize:   gem.MinimumBlockSize,
+		preferredBlockSize: gem.PreferredBlockSize,
+		maximumBlockSize:   gem.MaximumBlockSize,
+		memoryBlockSize:    gem.PreferredBlockSize,
 	}, nil
 }
 
@@ -943,6 +1008,18 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 // overwriting any existing backend for that name
 func RegisterBackend(name string, generator BackendGenerator) {
 	backendMap[name] = generator
+}
+
+// ContainsBackend allows you to check if a backend is already available,
+// even though you can still overwrite it with `RegisterBackend` in case you want.
+func ContainsBackend(name string) bool {
+	for k := range backendMap {
+		if k == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 // GetBackendNames returns the names of all registered backends
