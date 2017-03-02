@@ -26,7 +26,6 @@ servers:
   - name: foo
     driver: {{.Driver}}
     path: {{.TempDir}}/nbd.img
-    workers: 20
 {{if .NoFlush}}
     flush: false
     fua: false

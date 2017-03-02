@@ -19,10 +19,6 @@ import (
 	"golang.org/x/net/context"
 )
 
-// DefaultWorkers defines the default number of workers
-// used to reply back to the client
-const DefaultWorkers = 5
-
 // Map of configuration text to TLS versions
 var tlsVersionMap = map[string]uint16{
 	"ssl3.0": tls.VersionSSL30,
@@ -57,7 +53,6 @@ type Connection struct {
 	backend            Backend               // the backend implementation
 	wg                 sync.WaitGroup        // a waitgroup for the session; we mark this as done on exit
 	repCh              chan Reply            // a channel of replies that have to be sent
-	proCh              chan Request          // a channel of requests that have to be first processed, before they can be dispatched as reply
 	numInflight        int64                 // number of inflight requests
 	name               string                // the name of the connection for logging purposes
 	disconnectReceived int64                 // more then 0 if disconnect has been received
@@ -96,18 +91,7 @@ type Export struct {
 	name               string // name of the export
 	description        string // description of the export
 	readonly           bool   // true if read only
-	workers            int    // number of workers
 	tlsonly            bool   // true if only to be served over tls
-}
-
-// Request is an internal structue for propagating requests
-// onto the request goroutine to be sent from there
-type Request struct {
-	nbdReq nbdRequest // the request in nbd format
-	// length of payload,
-	// 0 in case no payload is retrieved from the connection
-	length  uint64
-	payload bytes.Buffer // the optional payload as a bytebuffer
 }
 
 // Reply is an internal structure for propagating replies
@@ -198,6 +182,9 @@ func (c *Connection) receive(ctx context.Context) {
 		c.wg.Done()
 	}()
 
+	// buffer used to write ZEROES
+	var zmBuffer bytes.Buffer
+
 	for {
 		// get request
 		var req nbdRequest
@@ -254,37 +241,6 @@ func (c *Connection) receive(ctx context.Context) {
 			}
 		}
 
-		request := Request{nbdReq: req}
-
-		if flags&CMDT_REQ_PAYLOAD != 0 {
-			if req.NbdLength == 0 {
-				c.logger.Printf("[ERROR] Client %s gave bad length", c.name)
-				return
-			}
-
-			request.length = uint64(req.NbdLength)
-			n, err := io.CopyN(&request.payload, c.conn, int64(req.NbdLength))
-
-			if err != nil {
-				if isClosedErr(err) {
-					// Don't report this - we closed it
-					return
-				}
-
-				c.logger.Printf("[ERROR] Client %s cannot read data to write: %s", c.name, err)
-				return
-			}
-
-			if uint64(n) != request.length {
-				c.logger.Printf("[ERROR] Client %s cannot read all data to write: %d != %d", c.name, n, request.length)
-				return
-
-			}
-		} else if flags&CMDT_REQ_FAKE_PAYLOAD != 0 {
-			request.length = uint64(req.NbdLength)
-			request.payload.Grow(int(req.NbdLength))
-		}
-
 		atomic.AddInt64(&c.numInflight, 1) // one more in flight
 
 		if flags&CMDT_CHECK_NOT_READ_ONLY != 0 && c.export.readonly {
@@ -299,160 +255,121 @@ func (c *Connection) receive(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
-		} else {
-			select {
-			case c.proCh <- request:
-			case <-ctx.Done():
-				return
+		}
+
+		rep := Reply{
+			nbdRep: nbdReply{
+				NbdReplyMagic: NBD_REPLY_MAGIC,
+				NbdHandle:     req.NbdHandle,
+				NbdError:      0,
+			},
+		}
+
+		fua := req.NbdCommandFlags&NBD_CMD_FLAG_FUA != 0
+
+		length := uint64(req.NbdLength) // make length local
+		offset := req.NbdOffset         // make offset local
+
+		// handle request command
+		switch req.NbdCommandType {
+		case NBD_CMD_READ:
+			rep.length = length
+
+			// WARNING: potential overflow (blocklen, offset)
+			n, err := c.backend.ReadAt(ctx, &rep.payload, int64(offset), int64(length))
+			if err != nil {
+				c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
+				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+				break
+			} else if uint64(n) != length {
+				c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, length, offset)
+				rep.nbdRep.NbdError = NBD_EIO
+				break
 			}
+
+		case NBD_CMD_WRITE:
+			// WARNING: potential overflow (blocklen, offset)
+			n, err := c.backend.WriteAt(ctx, c.conn, int64(offset), int64(length), fua)
+			if err != nil {
+				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
+				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+				break
+			} else if uint64(n) != length {
+				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
+				rep.nbdRep.NbdError = NBD_EIO
+				break
+			}
+
+		case NBD_CMD_WRITE_ZEROES:
+			zmBuffer.Reset()
+			zmBuffer.Grow(int(length))
+
+			// WARNING: potential overflow (blocklen, offset)
+			n, err := c.backend.WriteAt(ctx, &zmBuffer, int64(offset), int64(length), fua)
+			if err != nil {
+				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
+				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+				break
+			} else if uint64(n) != length {
+				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
+				rep.nbdRep.NbdError = NBD_EIO
+				break
+			}
+
+		case NBD_CMD_FLUSH:
+			c.backend.Flush(ctx)
+
+		case NBD_CMD_TRIM:
+			// WARNING: potential overflow (length, offset)
+			n, err := c.backend.TrimAt(ctx, int64(offset), int64(length))
+			if err != nil {
+				c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
+				rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+				break
+			} else if uint64(n) != length {
+				c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, length, offset)
+				rep.nbdRep.NbdError = NBD_EIO
+				break
+			}
+
+		case NBD_CMD_DISC:
+			c.waitForInflight(ctx, 1) // this request is itself in flight, so 1 is permissible
+			c.logger.Printf("[INFO] Client %s requested disconnect\n", c.name)
+			if err := c.backend.Flush(ctx); err != nil {
+				c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
+			}
+			return
+
+		case NBD_CMD_CLOSE:
+			c.waitForInflight(ctx, 1) // this request is itself in flight, so 1 is permissible
+			c.logger.Printf("[INFO] Client %s requested close\n", c.name)
+			if err := c.backend.Flush(ctx); err != nil {
+				c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
+			}
+			select {
+			case c.repCh <- rep:
+			case <-ctx.Done():
+			}
+			c.waitForInflight(ctx, 0) // wait for this request to be no longer inflight (i.e. reply transmitted)
+			c.logger.Printf("[INFO] Client %s close completed", c.name)
+			return
+
+		default:
+			c.logger.Printf("[ERROR] Client %s sent unknown command %d\n",
+				c.name, req.NbdCommandType)
+			return
+		}
+
+		select {
+		case c.repCh <- rep:
+		case <-ctx.Done():
+			return
 		}
 
 		// if we've recieved a disconnect, just sit waiting for the
 		// context to indicate we've done
 		if atomic.LoadInt64(&c.disconnectReceived) > 0 {
 			select {
-			case <-ctx.Done():
-				return
-			}
-		}
-	}
-}
-
-func (c *Connection) process(ctx context.Context, n int) {
-	defer func() {
-		c.logger.Printf("[INFO] Process Worker %d exiting for %s", n, c.name)
-		c.kill(ctx)
-		c.wg.Done()
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-c.proCh:
-			if !ok {
-				return
-			}
-
-			rep := Reply{
-				nbdRep: nbdReply{
-					NbdReplyMagic: NBD_REPLY_MAGIC,
-					NbdHandle:     req.nbdReq.NbdHandle,
-					NbdError:      0,
-				},
-			}
-
-			fua := req.nbdReq.NbdCommandFlags&NBD_CMD_FLAG_FUA != 0
-
-			length := uint64(req.nbdReq.NbdLength) // make length local
-			offset := req.nbdReq.NbdOffset         // make offset local
-
-			// handle request command
-			switch req.nbdReq.NbdCommandType {
-			case NBD_CMD_READ:
-				rep.length = length
-
-				for length > 0 {
-					blocklen := c.export.memoryBlockSize
-					if blocklen > length {
-						blocklen = length
-					}
-
-					// WARNING: potential overflow (blocklen, offset)
-					n, err := c.backend.ReadAt(ctx, &rep.payload, int64(offset), int64(blocklen))
-					if err != nil {
-						c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
-						rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-						break
-					} else if uint64(n) != blocklen {
-						c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, length, offset)
-						rep.nbdRep.NbdError = NBD_EIO
-						break
-					}
-
-					offset += blocklen
-					length -= blocklen
-				}
-
-			case NBD_CMD_WRITE, NBD_CMD_WRITE_ZEROES:
-				for length > 0 {
-					blocklen := c.export.memoryBlockSize
-					if blocklen > length {
-						blocklen = length
-					}
-
-					// WARNING: potential overflow (blocklen, offset)
-					n, err := c.backend.WriteAt(ctx, &req.payload,
-						int64(offset), int64(blocklen), fua)
-					if err != nil {
-						c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-						rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-						break
-					} else if uint64(n) != blocklen {
-						c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
-						rep.nbdRep.NbdError = NBD_EIO
-						break
-					}
-					offset += blocklen
-					length -= blocklen
-				}
-
-			case NBD_CMD_FLUSH:
-				c.backend.Flush(ctx)
-
-			case NBD_CMD_TRIM:
-				for length > 0 {
-					blocklen := c.export.memoryBlockSize
-					if blocklen > length {
-						blocklen = length
-					}
-
-					// WARNING: potential overflow (length, offset)
-					n, err := c.backend.TrimAt(ctx, int64(offset), int64(length))
-					if err != nil {
-						c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
-						rep.nbdRep.NbdError = errorCodeFromGolangError(err)
-						break
-					} else if uint64(n) != blocklen {
-						c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, length, offset)
-						rep.nbdRep.NbdError = NBD_EIO
-						break
-					}
-
-					offset += blocklen
-					length -= blocklen
-				}
-
-			case NBD_CMD_DISC:
-				c.waitForInflight(ctx, 1) // this request is itself in flight, so 1 is permissible
-				c.logger.Printf("[INFO] Client %s requested disconnect\n", c.name)
-				if err := c.backend.Flush(ctx); err != nil {
-					c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
-				}
-				return
-
-			case NBD_CMD_CLOSE:
-				c.waitForInflight(ctx, 1) // this request is itself in flight, so 1 is permissible
-				c.logger.Printf("[INFO] Client %s requested close\n", c.name)
-				if err := c.backend.Flush(ctx); err != nil {
-					c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
-				}
-				select {
-				case c.repCh <- rep:
-				case <-ctx.Done():
-				}
-				c.waitForInflight(ctx, 0) // wait for this request to be no longer inflight (i.e. reply transmitted)
-				c.logger.Printf("[INFO] Client %s close completed", c.name)
-				return
-
-			default:
-				c.logger.Printf("[ERROR] Client %s sent unknown command %d\n",
-					c.name, req.nbdReq.NbdCommandType)
-				return
-			}
-
-			select {
-			case c.repCh <- rep:
 			case <-ctx.Done():
 				return
 			}
@@ -493,7 +410,6 @@ func (c *Connection) Serve(parentCtx context.Context) {
 	ctx, cancelFunc := context.WithCancel(parentCtx)
 
 	c.repCh = make(chan Reply, 1024)
-	c.proCh = make(chan Request, 1024)
 	c.killCh = make(chan struct{})
 
 	c.conn = c.plainConn
@@ -516,7 +432,6 @@ func (c *Connection) Serve(parentCtx context.Context) {
 
 		c.wg.Wait()
 		close(c.repCh)
-		close(c.proCh)
 
 		c.logger.Printf("[INFO] Closed connection from %s", c.name)
 	}()
@@ -529,25 +444,13 @@ func (c *Connection) Serve(parentCtx context.Context) {
 
 	c.name = fmt.Sprintf("%s/%s", c.name, c.export.name)
 
-	workers := c.export.workers
-	if workers < 1 {
-		workers = DefaultWorkers
-	}
-
-	c.logger.Printf(
-		"[INFO] Negotiation succeeded with %s, serving with %d worker(s)",
-		c.name, workers)
+	c.logger.Printf("[INFO] Negotiation succeeded with %s", c.name)
 
 	// Phase #2: Transmition
 
 	c.wg.Add(2)
 	go c.receive(ctx)
 	go c.reply(ctx)
-
-	for i := 0; i < workers; i++ {
-		c.wg.Add(1)
-		go c.process(ctx, i)
-	}
 
 	// Wait until either we are explicitly killed or one of our
 	// workers dies
@@ -1027,7 +930,6 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 		exportFlags:        flags,
 		name:               ec.Name,
 		readonly:           ec.ReadOnly,
-		workers:            ec.Workers,
 		tlsonly:            ec.TLSOnly,
 		description:        ec.Description,
 		minimumBlockSize:   minimumBlockSize,
