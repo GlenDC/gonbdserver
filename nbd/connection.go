@@ -12,10 +12,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/context"
 )
+
+// DefaultWorkers defines the default number of workers
+// used to reply back to the client
+const DefaultWorkers = 5
 
 // Map of configuration text to TLS versions
 var tlsVersionMap = map[string]uint16{
@@ -49,16 +55,23 @@ type Connection struct {
 	listener           *Listener             // the listener than invoked us
 	export             *Export               // a pointer to the export
 	backend            Backend               // the backend implementation
+	wg                 sync.WaitGroup        // a waitgroup for the session; we mark this as done on exit
+	repCh              chan Reply            // a channel of replies that have to be sent
+	proCh              chan Request          // a channel of requests that have to be first processed, before they can be dispatched as reply
+	numInflight        int64                 // number of inflight requests
 	name               string                // the name of the connection for logging purposes
-	disconnectReceived bool                  // true if disconnect has been received
-	zeroWriteBuffer    bytes.Buffer          // the buffer used to write zero memory
+	disconnectReceived int64                 // more then 0 if disconnect has been received
+
+	killCh    chan struct{} // closed by workers to indicate a hard close is required
+	killed    bool          // true if killCh closed already
+	killMutex sync.Mutex    // protects killed
 }
 
 // Backend is an interface implemented by the various backend drivers
 type Backend interface {
-	WriteAt(ctx context.Context, r io.Reader, length, offset int64, fua bool) (int64, error) // write data to w at offset, with force unit access optional
-	ReadAt(ctx context.Context, r io.Writer, length, offset int64) (int64, error)            // read from o b at offset
-	TrimAt(ctx context.Context, length, offset int64) (int64, error)                         // trim
+	WriteAt(ctx context.Context, r io.Reader, offset, length int64, fua bool) (int64, error) // write data to w at offset, with force unit access optional
+	ReadAt(ctx context.Context, r io.Writer, offset, length int64) (int64, error)            // read from o b at offset
+	TrimAt(ctx context.Context, offset, length int64) (int64, error)                         // trim
 	Flush(ctx context.Context) error                                                         // flush
 	Close(ctx context.Context) error                                                         // close
 	Geometry(ctx context.Context) (uint64, uint64, uint64, uint64, error)                    // size, minimum BS, preferred BS, maximum BS
@@ -83,18 +96,26 @@ type Export struct {
 	name               string // name of the export
 	description        string // description of the export
 	readonly           bool   // true if read only
+	workers            int    // number of workers
 	tlsonly            bool   // true if only to be served over tls
 }
 
-// Request is an internal structure for propagating requests through the channels
+// Request is an internal structue for propagating requests
+// onto the request goroutine to be sent from there
 type Request struct {
-	nbdReq  nbdRequest // the request in nbd format
-	nbdRep  nbdReply   // the reply in nbd format
-	length  uint64     // the checked length
-	offset  uint64     // the checked offset
-	reqData [][]byte   // request data (e.g. for a write)
-	repData [][]byte   // reply data (e.g. for a read)
-	flags   uint64     // our internal flag structure characterizing the request
+	nbdReq nbdRequest // the request in nbd format
+	// length of payload,
+	// 0 in case no payload is retrieved from the connection
+	length  uint64
+	payload bytes.Buffer // the optional payload as a bytebuffer
+}
+
+// Reply is an internal structure for propagating replies
+// onto the reply goroutine to be sent from there
+type Reply struct {
+	nbdRep  nbdReply     // the reply in nbd format
+	length  uint64       // length of payload, 0 in case no payload is given
+	payload bytes.Buffer // the optional payload as a byteBuffer
 }
 
 // NewConnection returns a new Connection object
@@ -129,274 +150,340 @@ func isClosedErr(err error) bool {
 	return strings.HasSuffix(err.Error(), "use of closed network connection") // YUCK!
 }
 
-// readRequest reads and validates a request,
-// returning nil in case no (valid) request could be read.
-func (c *Connection) readRequest() *nbdRequest {
-	var req nbdRequest
-	if err := binary.Read(c.conn, binary.BigEndian, &req); err != nil {
-		if nerr, ok := err.(net.Error); ok {
-			if nerr.Timeout() {
-				c.logger.Printf("[INFO] Client %s timeout, closing connection", c.name)
-				return nil
+// reply handles the sending of replies over the connection
+// done async over a goroutine
+func (c *Connection) reply(ctx context.Context) {
+	defer func() {
+		c.logger.Printf("[INFO] Replyer exiting for %s", c.name)
+		c.kill(ctx)
+		c.wg.Done()
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rep, ok := <-c.repCh:
+			if !ok {
+				return
 			}
-		}
-		if isClosedErr(err) {
-			// Don't report this - we closed it
-			return nil
-		}
-		if err == io.EOF {
-			c.logger.Printf("[WARN] Client %s closed connection abruptly", c.name)
-		} else {
-			c.logger.Printf("[ERROR] Client %s could not read request: %s", c.name, err)
-		}
-		return nil
-	}
 
-	if req.NbdRequestMagic != NBD_REQUEST_MAGIC {
-		c.logger.Printf("[ERROR] Client %s had bad magic number in request", c.name)
-		return nil
-	}
+			// send the reply back
+			if err := binary.Write(c.conn, binary.BigEndian, rep.nbdRep); err != nil {
+				c.logger.Printf("[ERROR] Client %s cannot write reply header\n", c.name)
+				return
+			}
 
-	return &req
+			if rep.length > 0 {
+				length := rep.length
+				bytes := rep.payload.Bytes()
+
+				if n, err := c.conn.Write(bytes); err != nil || uint64(n) != length {
+					c.logger.Printf("[ERROR] Client %s cannot write reply", c.name)
+					return
+				}
+			}
+
+			atomic.AddInt64(&c.numInflight, -1) // one less in flight
+		}
+	}
 }
 
-// transmit tries to read a request,
-// handles the command and dispatches the reply.
-// Returns false in case nothing could be transmitted
-func (c *Connection) transmit(ctx context.Context) bool {
-	req := c.readRequest()
-	if req == nil {
-		return false
-	}
+// receive requests, process them and
+// dispatch the replies to be sent over another goroutine
+func (c *Connection) receive(ctx context.Context) {
+	defer func() {
+		c.logger.Printf("[INFO] Receiver exiting for %s", c.name)
+		c.kill(ctx)
+		c.wg.Done()
+	}()
 
-	// handle req flags
-	flags, ok := CmdTypeMap[int(req.NbdCommandType)]
-	if !ok {
-		c.logger.Printf(
-			"[ERROR] Client %s unknown command %d",
-			c.name, req.NbdCommandType)
-		return false
-	}
-
-	if flags&CMDT_SET_DISCONNECT_RECEIVED != 0 {
-		c.disconnectReceived = true
-		return false
-	}
-
-	// offset also previously known as 'addr'
-	var length, offset uint64
-
-	if flags&CMDT_CHECK_LENGTH_OFFSET != 0 {
-		length = uint64(req.NbdLength)
-		offset = req.NbdOffset
-
-		if length <= 0 || length+offset > c.export.size {
-			c.logger.Printf("[ERROR] Client %s gave bad offset or length", c.name)
-			return false
+	for {
+		// get request
+		var req nbdRequest
+		if err := binary.Read(c.conn, binary.BigEndian, &req); err != nil {
+			if nerr, ok := err.(net.Error); ok {
+				if nerr.Timeout() {
+					c.logger.Printf("[INFO] Client %s timeout, closing connection", c.name)
+					return
+				}
+			}
+			if isClosedErr(err) {
+				// Don't report this - we closed it
+				return
+			}
+			if err == io.EOF {
+				c.logger.Printf("[WARN] Client %s closed connection abruptly", c.name)
+			} else {
+				c.logger.Printf("[ERROR] Client %s could not read request: %s", c.name, err)
+			}
+			return
 		}
 
-		if length&(c.export.minimumBlockSize-1) != 0 || offset&(c.export.minimumBlockSize-1) != 0 || length > c.export.maximumBlockSize {
-			c.logger.Printf("[ERROR] Client %s gave offset or length outside blocksize paramaters cmd=%d (len=%08x,off=%08x,minbs=%08x,maxbs=%08x)", c.name, req.NbdCommandType, length, offset, c.export.minimumBlockSize, c.export.maximumBlockSize)
-			return false
-		}
-	}
-
-	// WARNING: for now I've removed other flag-related logic,
-	// let's see if we need any of it
-	// if so we'll have to bring it back
-
-	fua := req.NbdCommandFlags&NBD_CMD_FLAG_FUA != 0
-
-	nbdRep := nbdReply{
-		NbdReplyMagic: NBD_REPLY_MAGIC,
-		NbdHandle:     req.NbdHandle,
-		NbdError:      0,
-	}
-
-	if flags&CMDT_CHECK_NOT_READ_ONLY != 0 && c.export.readonly {
-		// send the reply back
-		if err := binary.Write(c.conn, binary.BigEndian, nbdRep); err != nil {
-			c.logger.Printf("[ERROR] Client %s cannot write reply header\n", c.name)
-			return false
+		if req.NbdRequestMagic != NBD_REQUEST_MAGIC {
+			c.logger.Printf("[ERROR] Client %s had bad magic number in request", c.name)
+			return
 		}
 
-		return true
-	}
+		// handle req flags
+		flags, ok := CmdTypeMap[int(req.NbdCommandType)]
+		if !ok {
+			c.logger.Printf(
+				"[ERROR] Client %s unknown command %d",
+				c.name, req.NbdCommandType)
+			return
+		}
 
-	// create a byteBuffer which can be used for writing
-	// we can't directly write, as we first need to write the header
-	var buffer *bytes.Buffer
+		if flags&CMDT_SET_DISCONNECT_RECEIVED != 0 {
+			// we process this here as commands may otherwise be processed out
+			// of order and per the spec we should not receive any more
+			// commands after receiving a disconnect
+			atomic.StoreInt64(&c.disconnectReceived, 1)
+		}
 
-	// handle request command
-	switch req.NbdCommandType {
-	case NBD_CMD_READ:
-		length := length // make length local
-		// need to write to a byteBuffer, as we can't write directly
-		// to the connection, due to having to have to write the header first
-		buffer = new(bytes.Buffer)
-
-		for i := 0; length > 0; i++ {
-			blocklen := c.export.memoryBlockSize
-			if blocklen > length {
-				blocklen = length
+		if flags&CMDT_CHECK_LENGTH_OFFSET != 0 {
+			length := uint64(req.NbdLength)
+			if length <= 0 || length+req.NbdOffset > c.export.size {
+				c.logger.Printf("[ERROR] Client %s gave bad offset or length", c.name)
+				return
 			}
 
-			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.ReadAt(ctx, buffer, int64(blocklen), int64(offset))
+			if length&(c.export.minimumBlockSize-1) != 0 || req.NbdOffset&(c.export.minimumBlockSize-1) != 0 || length > c.export.maximumBlockSize {
+				c.logger.Printf("[ERROR] Client %s gave offset or length outside blocksize paramaters cmd=%d (len=%08x,off=%08x,minbs=%08x,maxbs=%08x)", c.name, req.NbdCommandType, req.NbdLength, req.NbdOffset, c.export.minimumBlockSize, c.export.maximumBlockSize)
+				return
+			}
+		}
+
+		request := Request{nbdReq: req}
+
+		if flags&CMDT_REQ_PAYLOAD != 0 {
+			if req.NbdLength == 0 {
+				c.logger.Printf("[ERROR] Client %s gave bad length", c.name)
+				return
+			}
+
+			request.length = uint64(req.NbdLength)
+			n, err := io.CopyN(&request.payload, c.conn, int64(req.NbdLength))
+
 			if err != nil {
-				c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
-				nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != blocklen {
-				c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, length, offset)
-				nbdRep.NbdError = NBD_EIO
-				break
+				if isClosedErr(err) {
+					// Don't report this - we closed it
+					return
+				}
+
+				c.logger.Printf("[ERROR] Client %s cannot read data to write: %s", c.name, err)
+				return
 			}
 
-			offset += blocklen
-			length -= blocklen
+			if uint64(n) != request.length {
+				c.logger.Printf("[ERROR] Client %s cannot read all data to write: %d != %d", c.name, n, request.length)
+				return
+
+			}
+		} else if flags&CMDT_REQ_FAKE_PAYLOAD != 0 {
+			request.length = uint64(req.NbdLength)
+			request.payload.Grow(int(req.NbdLength))
 		}
 
-	case NBD_CMD_WRITE:
-		length, offset := length, offset // make length,offset local
-		for i := 0; length > 0; i++ {
-			blocklen := c.export.memoryBlockSize
-			if blocklen > length {
-				blocklen = length
+		atomic.AddInt64(&c.numInflight, 1) // one more in flight
+
+		if flags&CMDT_CHECK_NOT_READ_ONLY != 0 && c.export.readonly {
+			nbdRep := nbdReply{
+				NbdReplyMagic: NBD_REPLY_MAGIC,
+				NbdHandle:     req.NbdHandle,
+				NbdError:      NBD_EPERM,
 			}
 
-			// Previously we would read from a 2D byte slice
-			// when `req.flags&CMDT_REQ_PAYLOAD != 0` was true,
-			// which was true for these cases.
-			// Now we pipe the connection directly into the backend
-
-			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.WriteAt(ctx, c.conn, int64(blocklen), int64(offset), fua)
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-				nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != blocklen {
-				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
-				nbdRep.NbdError = NBD_EIO
-				break
+			select {
+			case c.repCh <- Reply{nbdRep: nbdRep}:
+			case <-ctx.Done():
+				return
 			}
-			offset += blocklen
-			length -= blocklen
+		} else {
+			select {
+			case c.proCh <- request:
+			case <-ctx.Done():
+				return
+			}
 		}
 
-	case NBD_CMD_WRITE_ZEROES:
-		length, offset := length, offset // make length,offset local
-		// Requires us to read zero data
-		// Previously a 2D slice buffer was allocated/reused and zero-memoried
-		// now we simply make use of the fact that a slice buffer
-		// in Golang is automaticly zero-memoried
-		c.zeroWriteBuffer.Reset()
-		c.zeroWriteBuffer.Grow(int(length))
-
-		for i := 0; length > 0; i++ {
-			blocklen := c.export.memoryBlockSize
-			if blocklen > length {
-				blocklen = length
+		// if we've recieved a disconnect, just sit waiting for the
+		// context to indicate we've done
+		if atomic.LoadInt64(&c.disconnectReceived) > 0 {
+			select {
+			case <-ctx.Done():
+				return
 			}
-
-			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.WriteAt(ctx, &c.zeroWriteBuffer,
-				int64(blocklen), int64(offset), fua)
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
-				nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != blocklen {
-				c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
-				nbdRep.NbdError = NBD_EIO
-				break
-			}
-			offset += blocklen
-			length -= blocklen
 		}
-
-	case NBD_CMD_FLUSH:
-		c.backend.Flush(ctx)
-
-	case NBD_CMD_TRIM:
-		length, offset := length, offset // make length,offset local
-		for i := 0; length > 0; i++ {
-			blocklen := c.export.memoryBlockSize
-			if blocklen > length {
-				blocklen = length
-			}
-
-			// WARNING: potential overflow (length, offset)
-			n, err := c.backend.TrimAt(ctx, int64(length), int64(offset))
-			if err != nil {
-				c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
-				nbdRep.NbdError = errorCodeFromGolangError(err)
-				break
-			} else if uint64(n) != blocklen {
-				c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, length, offset)
-				nbdRep.NbdError = NBD_EIO
-				break
-			}
-
-			offset += blocklen
-			length -= blocklen
-		}
-
-	case NBD_CMD_DISC:
-		c.logger.Printf("[INFO] Client %s requested disconnect\n", c.name)
-		if err := c.backend.Flush(ctx); err != nil {
-			c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
-		}
-
-		return true
-
-	case NBD_CMD_CLOSE:
-		c.logger.Printf("[INFO] Client %s requested close\n", c.name)
-		if err := c.backend.Flush(ctx); err != nil {
-			c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
-		}
-		// still need to reply
-
-	default:
-		c.logger.Printf("[ERROR] Client %s sent unknown command %d\n",
-			c.name, req.NbdCommandType)
-		return true // perhaps next command is valid
 	}
+}
 
-	// send the reply back
-	if err := binary.Write(c.conn, binary.BigEndian, nbdRep); err != nil {
-		c.logger.Printf("[ERROR] Client %s cannot write reply header\n", c.name)
-		return false
-	}
+func (c *Connection) process(ctx context.Context, n int) {
+	defer func() {
+		c.logger.Printf("[INFO] Process Worker %d exiting for %s", n, c.name)
+		c.kill(ctx)
+		c.wg.Done()
+	}()
 
-	if flags&CMDT_REP_PAYLOAD != 0 && buffer != nil && buffer.Len() > 0 {
-		length := length // make length local
-
-		for length > 0 {
-			blocklen := c.export.memoryBlockSize
-			if blocklen > length {
-				blocklen = length
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req, ok := <-c.proCh:
+			if !ok {
+				return
 			}
 
-			// WARNING: potential overflow (blocklen)
-			n, err := io.CopyN(c.conn, buffer, int64(blocklen))
-			if err != nil {
-				c.logger.Printf("[ERROR] Client %s cannot write reply payload: %s\n", c.name, err)
-				return false
+			rep := Reply{
+				nbdRep: nbdReply{
+					NbdReplyMagic: NBD_REPLY_MAGIC,
+					NbdHandle:     req.nbdReq.NbdHandle,
+					NbdError:      0,
+				},
 			}
-			// WARNING: potential underflow (n)
-			if uint64(n) != blocklen {
-				c.logger.Printf("[ERROR] Client %s cannot write reply complete payload: wrote %d bytes instead of %d bytes\n", c.name, n, length)
-				return false
+
+			fua := req.nbdReq.NbdCommandFlags&NBD_CMD_FLAG_FUA != 0
+
+			length := uint64(req.nbdReq.NbdLength) // make length local
+			offset := req.nbdReq.NbdOffset         // make offset local
+
+			// handle request command
+			switch req.nbdReq.NbdCommandType {
+			case NBD_CMD_READ:
+				rep.length = length
+
+				for length > 0 {
+					blocklen := c.export.memoryBlockSize
+					if blocklen > length {
+						blocklen = length
+					}
+
+					// WARNING: potential overflow (blocklen, offset)
+					n, err := c.backend.ReadAt(ctx, &rep.payload, int64(offset), int64(blocklen))
+					if err != nil {
+						c.logger.Printf("[WARN] Client %s got read I/O error: %s", c.name, err)
+						rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+						break
+					} else if uint64(n) != blocklen {
+						c.logger.Printf("[WARN] Client %s got incomplete read (%d != %d) at offset %d", c.name, n, length, offset)
+						rep.nbdRep.NbdError = NBD_EIO
+						break
+					}
+
+					offset += blocklen
+					length -= blocklen
+				}
+
+			case NBD_CMD_WRITE, NBD_CMD_WRITE_ZEROES:
+				for length > 0 {
+					blocklen := c.export.memoryBlockSize
+					if blocklen > length {
+						blocklen = length
+					}
+
+					// WARNING: potential overflow (blocklen, offset)
+					n, err := c.backend.WriteAt(ctx, &req.payload,
+						int64(offset), int64(blocklen), fua)
+					if err != nil {
+						c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
+						rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+						break
+					} else if uint64(n) != blocklen {
+						c.logger.Printf("[WARN] Client %s got incomplete write (%d != %d) at offset %d", c.name, n, length, offset)
+						rep.nbdRep.NbdError = NBD_EIO
+						break
+					}
+					offset += blocklen
+					length -= blocklen
+				}
+
+			case NBD_CMD_FLUSH:
+				c.backend.Flush(ctx)
+
+			case NBD_CMD_TRIM:
+				for length > 0 {
+					blocklen := c.export.memoryBlockSize
+					if blocklen > length {
+						blocklen = length
+					}
+
+					// WARNING: potential overflow (length, offset)
+					n, err := c.backend.TrimAt(ctx, int64(offset), int64(length))
+					if err != nil {
+						c.logger.Printf("[WARN] Client %s got trim I/O error: %s", c.name, err)
+						rep.nbdRep.NbdError = errorCodeFromGolangError(err)
+						break
+					} else if uint64(n) != blocklen {
+						c.logger.Printf("[WARN] Client %s got incomplete trim (%d != %d) at offset %d", c.name, n, length, offset)
+						rep.nbdRep.NbdError = NBD_EIO
+						break
+					}
+
+					offset += blocklen
+					length -= blocklen
+				}
+
+			case NBD_CMD_DISC:
+				c.waitForInflight(ctx, 1) // this request is itself in flight, so 1 is permissible
+				c.logger.Printf("[INFO] Client %s requested disconnect\n", c.name)
+				if err := c.backend.Flush(ctx); err != nil {
+					c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
+				}
+				return
+
+			case NBD_CMD_CLOSE:
+				c.waitForInflight(ctx, 1) // this request is itself in flight, so 1 is permissible
+				c.logger.Printf("[INFO] Client %s requested close\n", c.name)
+				if err := c.backend.Flush(ctx); err != nil {
+					c.logger.Printf("[ERROR] Client %s cannot flush backend: %s\n", c.name, err)
+				}
+				select {
+				case c.repCh <- rep:
+				case <-ctx.Done():
+				}
+				c.waitForInflight(ctx, 0) // wait for this request to be no longer inflight (i.e. reply transmitted)
+				c.logger.Printf("[INFO] Client %s close completed", c.name)
+				return
+
+			default:
+				c.logger.Printf("[ERROR] Client %s sent unknown command %d\n",
+					c.name, req.nbdReq.NbdCommandType)
+				return
 			}
-			length -= blocklen
+
+			select {
+			case c.repCh <- rep:
+			case <-ctx.Done():
+				return
+			}
 		}
-
-		buffer = nil
 	}
+}
 
-	return true
+// kill a connection.
+// This safely ensures the kill channel is closed if it isn't already, which will
+// kill all the goroutines
+func (c *Connection) kill(ctx context.Context) {
+	c.killMutex.Lock()
+	defer c.killMutex.Unlock()
+	if !c.killed {
+		close(c.killCh)
+		c.killed = true
+	}
+}
+
+func (c *Connection) waitForInflight(ctx context.Context, limit int64) {
+	c.logger.Printf("[INFO] Client %s waiting for inflight requests prior to disconnect", c.name)
+	for {
+		if atomic.LoadInt64(&c.numInflight) <= limit {
+			return
+		}
+		// this is pretty nasty in that it would be nicer to wait on
+		// a channel or use a (non-existent) waitgroup with timer.
+		// however it's only one atomic read every 10ms and this
+		// will hardly ever occur
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // Serve the two phases of an NBD connection.
@@ -404,6 +491,10 @@ func (c *Connection) transmit(ctx context.Context) bool {
 // The second phase is the transmition of data, replies based on requests.
 func (c *Connection) Serve(parentCtx context.Context) {
 	ctx, cancelFunc := context.WithCancel(parentCtx)
+
+	c.repCh = make(chan Reply, 1024)
+	c.proCh = make(chan Request, 1024)
+	c.killCh = make(chan struct{})
 
 	c.conn = c.plainConn
 	c.name = c.plainConn.RemoteAddr().String()
@@ -418,9 +509,16 @@ func (c *Connection) Serve(parentCtx context.Context) {
 		if c.tlsConn != nil {
 			c.tlsConn.Close()
 		}
-
-		c.conn.Close()
+		c.plainConn.Close()
 		cancelFunc()
+
+		c.kill(ctx) // to ensure the kill channel is closed
+
+		c.wg.Wait()
+		close(c.repCh)
+		close(c.proCh)
+
+		c.logger.Printf("[INFO] Closed connection from %s", c.name)
 	}()
 
 	// Phase #1: Negotiation
@@ -430,30 +528,35 @@ func (c *Connection) Serve(parentCtx context.Context) {
 	}
 
 	c.name = fmt.Sprintf("%s/%s", c.name, c.export.name)
-	c.logger.Printf("[INFO] Negotiation succeeded with %s, serving synchronously", c.name)
+
+	workers := c.export.workers
+	if workers < 1 {
+		workers = DefaultWorkers
+	}
+
+	c.logger.Printf(
+		"[INFO] Negotiation succeeded with %s, serving with %d worker(s)",
+		c.name, workers)
 
 	// Phase #2: Transmition
-	// basically keep reading until we can't any longer
-	for c.transmit(ctx) {
-	}
-}
 
-// skip bytes
-func skip(r io.Reader, n uint32) error {
-	for n > 0 {
-		l := n
-		if l > 1024 {
-			l = 1024
-		}
-		b := make([]byte, l)
-		if nr, err := io.ReadFull(r, b); err != nil {
-			return err
-		} else if nr != int(l) {
-			return errors.New("skip returned short read")
-		}
-		n -= l
+	c.wg.Add(2)
+	go c.receive(ctx)
+	go c.reply(ctx)
+
+	for i := 0; i < workers; i++ {
+		c.wg.Add(1)
+		go c.process(ctx, i)
 	}
-	return nil
+
+	// Wait until either we are explicitly killed or one of our
+	// workers dies
+	select {
+	case <-c.killCh:
+		c.logger.Printf("[INFO] Worker forced close for %s", c.name)
+	case <-ctx.Done():
+		c.logger.Printf("[INFO] Parent forced close for %s", c.name)
+	}
 }
 
 // negotiate negotiates a connection
@@ -819,6 +922,24 @@ func (c *Connection) negotiate(ctx context.Context) error {
 	return nil
 }
 
+// skip bytes
+func skip(r io.Reader, n uint32) error {
+	for n > 0 {
+		l := n
+		if l > 1024 {
+			l = 1024
+		}
+		b := make([]byte, l)
+		if nr, err := io.ReadFull(r, b); err != nil {
+			return err
+		} else if nr != int(l) {
+			return errors.New("skip returned short read")
+		}
+		n -= l
+	}
+	return nil
+}
+
 // getExport generates an export for a given name
 func (c *Connection) getExportConfig(ctx context.Context, name string) (*ExportConfig, error) {
 	for _, ec := range c.listener.exports {
@@ -906,6 +1027,7 @@ func (c *Connection) connectExport(ctx context.Context, ec *ExportConfig) (*Expo
 		exportFlags:        flags,
 		name:               ec.Name,
 		readonly:           ec.ReadOnly,
+		workers:            ec.Workers,
 		tlsonly:            ec.TLSOnly,
 		description:        ec.Description,
 		minimumBlockSize:   minimumBlockSize,

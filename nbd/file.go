@@ -1,7 +1,7 @@
 package nbd
 
 import (
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"strconv"
@@ -16,43 +16,38 @@ type FileBackend struct {
 }
 
 // WriteAt implements Backend.WriteAt
-func (fb *FileBackend) WriteAt(ctx context.Context, r io.Reader, length, offset int64, fua bool) (int64, error) {
-	// Set offset relative to origin of file
-	o, err := fb.file.Seek(offset, 0)
-	if err != nil {
-		return 0, fmt.Errorf("couldn't set offset %d: %s", offset, err)
-	}
-	if o != offset {
-		return 0, fmt.Errorf("couldn't set offset %d: got offset at %d instead", offset, o)
-	}
+func (fb *FileBackend) WriteAt(ctx context.Context, r io.Reader, offset, length int64, fua bool) (int64, error) {
+	buffer := make([]byte, length)
+	r.Read(buffer)
 
-	n, err := io.CopyN(fb.file, r, length)
+	n, err := fb.file.WriteAt(buffer, offset)
 	if err != nil || !fua {
-		return n, err
+		return int64(n), err
 	}
 	err = fb.file.Sync()
 	if err != nil {
 		return 0, err
 	}
-	return n, err
+	return int64(n), err
 }
 
 // ReadAt implements Backend.ReadAt
-func (fb *FileBackend) ReadAt(ctx context.Context, w io.Writer, length, offset int64) (int64, error) {
-	// Set offset relative to origin of file
-	o, err := fb.file.Seek(offset, 0)
+func (fb *FileBackend) ReadAt(ctx context.Context, w io.Writer, offset, length int64) (int64, error) {
+	buffer := make([]byte, length)
+	n, err := fb.file.ReadAt(buffer, offset)
 	if err != nil {
-		return 0, fmt.Errorf("couldn't set offset %d: %s", offset, err)
+		return 0, err
 	}
-	if o != offset {
-		return 0, fmt.Errorf("couldn't set offset %d: got offset at %d instead", offset, o)
+	if int64(n) != length {
+		return 0, errors.New("wrong size")
 	}
 
-	return io.CopyN(w, fb.file, length)
+	n, err = w.Write(buffer)
+	return int64(n), err
 }
 
 // TrimAt implements Backend.TrimAt
-func (fb *FileBackend) TrimAt(ctx context.Context, length, offset int64) (int64, error) {
+func (fb *FileBackend) TrimAt(ctx context.Context, offset, length int64) (int64, error) {
 	return length, nil
 }
 

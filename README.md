@@ -92,6 +92,7 @@ servers:
   - name: foo                    # The first is named 'foo' and
     driver: file                 # Uses the 'file' driver
     path: /tmp/test              # This uses /tmp/test as the file
+    workers: 4                   # Use 4 workers
   - name: bar                    # The second export is called 'bar'
     readonly: true               # This is readonly
     driver: rbd                  # And uses the (currently imaginary) rbd driver
@@ -144,6 +145,7 @@ Each `export` item consists of the following (common to all drivers):
 * `description:` the human readable description of the export. Optional, defaults to an empty string.
 * `driver:` the driver. Currently valid drivers are: `file`. Mandatory.
 * `readonly:` set to `true` for readonly, `false` otherwise. Optional, defaults to `false`.
+* `workers:` the number of simultaneous worker threads. Optional, defaults to 5.
 * `tlsonly:` set to `true` if the export is only to be provided over TLS, `false` otherwise. Optional, defaults to `false`
 * `minimumblocksize:` set to the minimum block size (must be a power of two). Optional, defaults to driver's minimum block size
 * `preferredblocksize:` set to the preferred block size (must be a power of two). Optional, defaults to driver's preferred block size

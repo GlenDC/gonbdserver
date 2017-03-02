@@ -35,6 +35,7 @@ servers:
   - name: foo
     driver: file
     path: /tmp/test
+    workers: 5
   - name: bar
     readonly: true
     driver: rbd
@@ -93,6 +94,7 @@ type ExportConfig struct {
 	Description        string                 // description of export
 	Driver             string                 // name of the driver
 	ReadOnly           bool                   // true of the export should be opened readonly
+	Workers            int                    // number of concurrent workers
 	TLSOnly            bool                   // true if the export should only be served over TLS
 	MinimumBlockSize   uint64                 // minimum block size
 	PreferredBlockSize uint64                 // preferred block size
