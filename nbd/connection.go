@@ -213,6 +213,16 @@ func (c *Connection) transmit(ctx context.Context) bool {
 		NbdError:      0,
 	}
 
+	if flags&CMDT_CHECK_NOT_READ_ONLY != 0 && c.export.readonly {
+		// send the reply back
+		if err := binary.Write(c.conn, binary.BigEndian, nbdRep); err != nil {
+			c.logger.Printf("[ERROR] Client %s cannot write reply header\n", c.name)
+			return false
+		}
+
+		return true
+	}
+
 	// create a byteBuffer which can be used for writing
 	// we can't directly write, as we first need to write the header
 	var buffer *bytes.Buffer
@@ -357,7 +367,7 @@ func (c *Connection) transmit(ctx context.Context) bool {
 	// send the reply back
 	if err := binary.Write(c.conn, binary.BigEndian, nbdRep); err != nil {
 		c.logger.Printf("[ERROR] Client %s cannot write reply header\n", c.name)
-		return true
+		return false
 	}
 
 	if flags&CMDT_REP_PAYLOAD != 0 && buffer != nil && buffer.Len() > 0 {
