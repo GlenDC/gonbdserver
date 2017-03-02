@@ -51,6 +51,7 @@ type Connection struct {
 	backend            Backend               // the backend implementation
 	name               string                // the name of the connection for logging purposes
 	disconnectReceived bool                  // true if disconnect has been received
+	zeroWriteBuffer    bytes.Buffer          // the buffer used to write zero memory
 }
 
 // Backend is an interface implemented by the various backend drivers
@@ -280,7 +281,8 @@ func (c *Connection) transmit(ctx context.Context) bool {
 		// Previously a 2D slice buffer was allocated/reused and zero-memoried
 		// now we simply make use of the fact that a slice buffer
 		// in Golang is automaticly zero-memoried
-		zeroBuffer := bytes.NewBuffer(make([]byte, length))
+		c.zeroWriteBuffer.Reset()
+		c.zeroWriteBuffer.Grow(int(length))
 
 		for i := 0; length > 0; i++ {
 			blocklen := c.export.memoryBlockSize
@@ -289,7 +291,8 @@ func (c *Connection) transmit(ctx context.Context) bool {
 			}
 
 			// WARNING: potential overflow (blocklen, offset)
-			n, err := c.backend.WriteAt(ctx, zeroBuffer, int64(blocklen), int64(offset), fua)
+			n, err := c.backend.WriteAt(ctx, &c.zeroWriteBuffer,
+				int64(blocklen), int64(offset), fua)
 			if err != nil {
 				c.logger.Printf("[WARN] Client %s got write I/O error: %s", c.name, err)
 				nbdRep.NbdError = errorCodeFromGolangError(err)
