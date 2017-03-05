@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"sync"
 
 	"golang.org/x/net/context"
 )
@@ -13,10 +14,15 @@ import (
 type FileBackend struct {
 	file *os.File
 	size uint64
+	mux  sync.Mutex
 }
 
 // WriteAt implements Backend.WriteAt
 func (fb *FileBackend) WriteAt(ctx context.Context, r io.Reader, offset, length int64, fua bool) (int64, error) {
+	// Requiring Mutex as we require 2 system calls
+	fb.mux.Lock()
+	defer fb.mux.Unlock()
+
 	// Set offset relative to origin of file
 	o, err := fb.file.Seek(offset, 0)
 	if err != nil {
@@ -39,6 +45,10 @@ func (fb *FileBackend) WriteAt(ctx context.Context, r io.Reader, offset, length 
 
 // ReadAt implements Backend.ReadAt
 func (fb *FileBackend) ReadAt(ctx context.Context, w io.Writer, offset, length int64) (int64, error) {
+	// Requiring Mutex as we require 2 system calls
+	fb.mux.Lock()
+	defer fb.mux.Unlock()
+
 	// Set offset relative to origin of file
 	o, err := fb.file.Seek(offset, 0)
 	if err != nil {
